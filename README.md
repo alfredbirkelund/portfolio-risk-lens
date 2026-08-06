@@ -12,7 +12,7 @@ you're already reading.
 It is a **userscript**: one file, no server, no account, no build step, no telemetry.
 Your holdings and all cached prices stay in your browser.
 
-![status](https://img.shields.io/badge/version-1.0.0-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
+![status](https://img.shields.io/badge/version-1.1.0-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
@@ -59,8 +59,8 @@ Nordic broker export imports without editing.
 - A what-if sandbox: edit any weight, recompute volatility, concentration and drawdown.
 - Historical stress windows (COVID crash, 2022 rate shock, 2023 banking wobble, the August
   2024 yen unwind) replayed through your *current* weights.
-- Vol-targeted sizing: the weight at which each name would consume a set share of portfolio
-  volatility.
+- Equal-risk sizing: what each holding would weigh if every position contributed the same
+  share of portfolio risk, with positions exceeding a set risk share flagged.
 
 **Data** — cache stats, one-click export of everything, and a self-test button.
 
