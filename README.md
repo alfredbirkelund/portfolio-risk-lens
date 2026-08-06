@@ -205,10 +205,13 @@ cheapest way to catch a unit error is to convert back and see if you land where 
 
 **v1.0.0.** Engine, data layer and rendering are tested against live data. Be aware of these:
 
-- **Interaction is untested in a real browser.** Every tab renders correctly and the numbers
-  are verified, but clicking, weight editing, the scenario recompute, CSV file drop, the SPA
-  re-mount and dark mode against stockanalysis's own theme have not been exercised by a human
-  or a driver. Expect rough edges and please open issues.
+- **Browser-tested, but not exhaustively.** The button, ticker detection, the overlay, all
+  four tabs, the scenario recompute and CSV import of a Danish semicolon file have been driven
+  in Chrome against a live stockanalysis page — that pass found and fixed four bugs the
+  headless harnesses could not see. Still unexercised: installation through Tampermonkey
+  itself (testing injected the script directly), Firefox and Safari, dark-mode host pages,
+  the SPA re-mount after client-side navigation, and drag-and-drop of a CSV file. Please open
+  issues.
 - Look-through covers each fund's **published top holdings** — typically the top ten. The
   remainder is reported as unitemised rather than silently dropped, but a name sitting at
   position 40 of an index fund will not appear by name.

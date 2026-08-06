@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.0.1 — 2026-08-06
+
+Four fixes, all found by rendering the overlay over a live stockanalysis page
+and clicking through it. Every one passed the headless harnesses first — which
+is the point: some bugs only exist in a browser.
+
+### Fixed
+
+- **Theme followed the OS instead of the host page.** A user whose OS is dark
+  but who reads stockanalysis in light mode got a dark panel over a white page.
+  Theme now comes from the page: explicit `data-theme`/class signals first, then
+  the measured background luminance, with the OS preference only as a fallback.
+- **The lookback setting was silently ignored.** stockanalysis disregards the
+  range parameter and returns everything it holds — 11,048 bars from 1982 for
+  AAPL — so any portfolio served by the fallback was analysed over 33 years
+  regardless of the setting, and the cache grew to 1.7 MB. Trimming is central
+  now, so the window means the same thing whichever tier answered.
+- **Vol-targeted sizing produced an unusable book.** The old formula asked what
+  weight makes a position's standalone volatility equal 2% of portfolio
+  volatility; across five holdings it suggested weights of 1–2% each, i.e. 92%
+  cash. Replaced with **equal-risk (inverse-volatility) weights** — the standard
+  risk-parity approximation, always fully invested — plus a flag on positions
+  whose actual risk contribution exceeds a configurable share.
+- **The correlation heatmap floated in whitespace.** It used `width="100%"`, so
+  a five-name matrix sat marooned in the middle of a very wide card. It now
+  carries its natural width and scrolls only when genuinely wider than the panel.
+
+`isDark()` is also defensive, since it can run where `getComputedStyle` or
+`getAttribute` are unavailable.
+
+### Verified in a real browser
+
+Ticker detection from the URL (`/stocks/aapl/` → `AAPL`), the floating button,
+the overlay, all four tabs, the scenario recompute (AAPL to 45% moved volatility
+18.8% → 22.2%, top-3 to 74%, and correctly warned that weights summed to 128.9%
+and were normalised), CSV import of a Danish semicolon file with decimal commas
+(`1.234,50` → `1234.50`), and the self-test.
+
+The stockanalysis fallback was exercised for real: injected into the page,
+Yahoo is CORS-blocked, so every price came from the second tier and the warning
+banner correctly explained what was degraded and what was not.
+
 ## v1.0.0 — 2026-08-06
 
 First complete release. The engine, the data layer and the interface are all
