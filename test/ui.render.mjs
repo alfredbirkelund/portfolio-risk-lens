@@ -19,12 +19,13 @@ const jar = new Map();
 const el = () => ({
   id: '', className: '', innerHTML: '', textContent: '', style: {}, dataset: {},
   classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+  getAttribute: () => null, setAttribute() {},
   appendChild() {}, remove() {}, addEventListener() {}, click() {},
   querySelector: () => null, querySelectorAll: () => []
 });
 const documentStub = {
   body: el(),
-  documentElement: { classList: { contains: () => false }, style: {} },
+  documentElement: { classList: { contains: () => false }, style: {}, getAttribute: () => null },
   createElement: el,
   getElementById: () => null,
   querySelector: () => null,
@@ -59,6 +60,8 @@ const ctx = {
   },
   document: documentStub,
   window: { matchMedia: () => ({ matches: false }) },
+  // Light surface, matching the default the palette was validated against.
+  getComputedStyle: () => ({ backgroundColor: 'rgb(252, 252, 251)' }),
   location: { pathname: '/stocks/aapl/', href: 'https://stockanalysis.com/stocks/aapl/' },
   setInterval: () => 0,
   console
@@ -145,6 +148,32 @@ check('overlaps list non-empty', r.exposures.overlaps.length > 0,
 check('unitemised fund remainder tracked', r.exposures.unitemised > 0,
   `${(r.exposures.unitemised * 100).toFixed(1)}% beyond published top holdings`);
 
+
+// --- regressions found by driving it in a real browser ----------------------
+/*
+ * stockanalysis ignores the range parameter and returns everything it has —
+ * 11,048 bars from 1982 for AAPL. Untrimmed that silently overrode the user's
+ * lookback and grew the cache to 1.7 MB. Trimming is central now; this guards
+ * it. A 10-year window is ~520 weekly observations, so 900 is a generous cap
+ * that still catches a 30-year series slipping through.
+ */
+{
+  const yrs = api.settings().years;
+  const perYear = r.freq === 'weekly' ? 52 : 252;
+  check('lookback honoured regardless of source', r.obs <= yrs * perYear * 1.15,
+    `${r.obs} ${r.freq} observations for a ${yrs}y window (cap ${Math.round(yrs * perYear * 1.15)})`);
+}
+
+check('equal-risk weights are fully invested', (() => {
+  if (!r.risk) return false;
+  const inv = r.risk.assetVol.map((v) => (v > 0 ? 1 / v : 0));
+  const sum = inv.reduce((a, b) => a + b, 0);
+  const w = inv.map((v) => v / sum);
+  const tot = w.reduce((a, b) => a + b, 0);
+  return Math.abs(tot - 1) < 1e-9 && w.every((x) => x > 0.02);
+})(), 'inverse-vol weights sum to 1 with no absurdly small suggestion');
+
+
 // --- fallback price source --------------------------------------------------
 check('fallback declines non-US symbols', !api.StockAnalysis.supports('7203.T') && !api.StockAnalysis.supports('USDDKK=X'));
 check('fallback accepts US symbols', api.StockAnalysis.supports('AAPL'));
@@ -180,6 +209,12 @@ check('no NaN leaked into markup', !/NaN/.test(all));
 check('heatmap emitted cells', (tabs.risk.match(/<rect/g) || []).length > 25,
   `${(tabs.risk.match(/<rect/g) || []).length} rects`);
 check('look-through card rendered', /Look-through exposure/.test(tabs.risk));
+// The heatmap used width="100%", which left a 5-name matrix floating in the
+// middle of a very wide card. It must carry its natural pixel width instead.
+check('heatmap uses its natural width, not 100%',
+  /<svg viewBox="0 0 (\d+) \1" width="\1"/.test(tabs.risk), 'square viewBox with matching px width');
+check('equal-risk card replaced vol-targeted sizing',
+  /Equal-risk sizing/.test(tabs.scenarios) && !/Vol-targeted sizing/.test(tabs.scenarios));
 check('overlap called out in prose', /true exposure of/i.test(tabs.risk));
 check('CSV import UI present', /prl-csvtext/.test(tabs.positions));
 check('settings panel present', /prl-setsave/.test(tabs.data));

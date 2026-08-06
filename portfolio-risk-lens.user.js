@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Portfolio Risk Lens
 // @namespace    https://github.com/alfredbirkelund/portfolio-risk-lens
-// @version      1.0.0
+// @version      1.0.1
 // @description  Portfolio construction and risk management overlay for stockanalysis.com. Correlation, risk contribution, currency/sector exposure with ETF look-through, scenario sandbox and vol-targeted sizing. All data stays on your machine.
 // @author       Alfred Birkelund
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.0.1';
 
   // ==========================================================================
   // 1. CONFIG
@@ -37,7 +37,7 @@
     benchmark: 'URTH',        // iShares MSCI World; '^GSPC' for S&P 500
     years: 10,                // history window; must reach the oldest stress window
     freq: 'auto',             // 'auto' | 'weekly' | 'daily'
-    volTargetPct: 2.0,        // per-position risk budget, % of portfolio vol
+    maxRiskPct: 30,           // flag positions contributing more than this share of risk
     barsTtlHours: 12,         // refetch bars older than this
     metaTtlDays: 30           // sector/holdings move slowly
   };
@@ -218,6 +218,14 @@
   //    fallback for the US sleeve rather than a general replacement.
   // ==========================================================================
 
+  /** Keep only the trailing `years` of a [[isoDate, value]] series. */
+  function trimToYears(rows, years) {
+    if (!years || !rows || rows.length < 2) return rows;
+    const cut = new Date(Date.now() - years * 365.25 * 864e5).toISOString().slice(0, 10);
+    const i = rows.findIndex((r) => r[0] >= cut);
+    return i > 0 ? rows.slice(i) : rows;
+  }
+
   const StockAnalysis = {
     supports: (symbol) => !/[.=^]/.test(symbol),   // plain US tickers only
 
@@ -263,7 +271,13 @@
       ]) {
         try {
           const fresh = await src.get();
-          const rec = { fetched: Date.now(), currency: fresh.currency, rows: fresh.rows, source: src.name, stale: false };
+          // Sources honour the requested window inconsistently — stockanalysis
+          // ignores it entirely and hands back everything it has, which for
+          // AAPL is 11,000 bars from 1982. Trim centrally so the lookback
+          // setting means the same thing whichever tier answered, and so the
+          // cache does not quietly grow to megabytes.
+          const rows = trimToYears(fresh.rows, settings().years);
+          const rec = { fetched: Date.now(), currency: fresh.currency, rows, source: src.name, stale: false };
           Store.set(key, rec);
           return rec;
         } catch (e) { tried.push(`${src.name}: ${e.message || e}`); }
@@ -967,8 +981,39 @@
     }
   };
 
-  const isDark = () => document.documentElement.classList.contains('dark') ||
-    window.matchMedia('(prefers-color-scheme: dark)').matches;
+  /**
+   * Follow the *host page*, not the operating system.
+   *
+   * This is an overlay. A user whose OS is dark but who reads stockanalysis in
+   * light mode got a dark panel slapped over a white page — jarring, and wrong.
+   * Explicit signals win; otherwise measure the page's actual background
+   * luminance, which works whatever convention the site happens to use. The OS
+   * preference is only the last resort.
+   */
+  function isDark() {
+    try {
+      const de = document.documentElement;
+      const attr = (de.getAttribute && (de.getAttribute('data-theme') || de.getAttribute('data-color-mode'))) || null;
+      if (attr === 'dark') return true;
+      if (attr === 'light') return false;
+      if (de.classList && de.classList.contains('dark')) return true;
+      if (de.classList && de.classList.contains('light')) return false;
+      if (typeof getComputedStyle === 'function') {
+        for (const el of [document.body, de]) {
+          if (!el) continue;
+          const m = String(getComputedStyle(el).backgroundColor || '')
+            .match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+          if (m && (m[4] === undefined || Number(m[4]) > 0.5)) {
+            const [r, g, b] = [1, 2, 3].map((i) => Number(m[i]));
+            return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128;
+          }
+        }
+      }
+      return window.matchMedia('(prefers-color-scheme: dark)').matches;
+    } catch (e) {
+      return false;   // a wrong-but-legible light theme beats throwing mid-render
+    }
+  }
   const P = () => (isDark() ? PALETTE.dark : PALETTE.light);
 
   const pct = (v, d = 1) => (v === null || v === undefined || !isFinite(v)) ? '—' : (v * 100).toFixed(d) + '%';
@@ -1070,7 +1115,10 @@
     };
     const col = (r) => r >= 0 ? mix(p.divMid, p.divPos, Math.min(1, r)) : mix(p.divMid, p.divNeg, Math.min(1, -r));
 
-    let s = `<svg viewBox="0 0 ${size} ${size}" width="100%" height="${Math.min(size, 640)}" role="img">`;
+    // Natural size, left-aligned. A percentage width made a five-name matrix
+    // float in the middle of a very wide empty card; .prl-sc scrolls when the
+    // matrix is genuinely wider than the panel.
+    let s = `<svg viewBox="0 0 ${size} ${size}" width="${size}" height="${size}" style="display:block;max-width:100%;height:auto" role="img">`;
     order.forEach((oi, i) => {
       s += `<text x="${pad - 7}" y="${pad + i * cell + cell / 2 + 4}" text-anchor="end" font-size="10" fill="${p.ink2}">${esc(labels[oi])}</text>`;
       s += `<text transform="translate(${pad + i * cell + cell / 2},${pad - 7}) rotate(-45)" font-size="10" fill="${p.ink2}">${esc(labels[oi])}</text>`;
@@ -1310,12 +1358,25 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
     const sc = STATE.scenario || r.positions.map((p) => p.weight * 100);
     const S = settings();
 
-    // vol-targeted size: weight at which a position eats volTargetPct of the book
-    const sized = r.positions.map((p, i) => {
-      const av = k.assetVol[i];
-      const suggested = av > 0 ? (S.volTargetPct / 100) * k.volAnn / av : null;
-      return { sym: p.sym, vol: av, cur: p.weight, sug: suggested };
-    });
+    /*
+     * Equal-risk (inverse-volatility) weights.
+     *
+     * The previous formula asked "what weight makes this position's standalone
+     * volatility equal X% of portfolio volatility", which with a 2% budget and
+     * five holdings suggested weights of 1-2% each — a book that is 92% cash.
+     * The question people actually want answered is "what would each position
+     * weigh if every one contributed the same risk", which is w ∝ 1/σ,
+     * normalised. It is the standard risk-parity approximation and it always
+     * produces a fully-invested book.
+     */
+    const inv = k.assetVol.map((v) => (v > 0 ? 1 / v : 0));
+    const invSum = inv.reduce((a, b) => a + b, 0);
+    const sized = r.positions.map((p, i) => ({
+      sym: p.sym, vol: k.assetVol[i], cur: p.weight,
+      sug: invSum > 0 ? inv[i] / invSum : null,
+      contrib: k.contrib[i],
+      over: k.contrib[i] > S.maxRiskPct / 100
+    }));
 
     const rows = r.positions.map((p, i) => `<tr>
       <td><b>${esc(p.sym)}</b></td>
@@ -1346,13 +1407,15 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
       </div>
 
       <div class="prl-card">
-        <h2>Vol-targeted sizing</h2>
-        <p class="sub">Weight at which each name would consume ${S.volTargetPct}% of portfolio volatility. A guide for sizing conviction against risk, not an instruction.</p>
+        <h2>Equal-risk sizing</h2>
+        <p class="sub">What each position would weigh if every holding contributed the same share of portfolio risk — the inverse-volatility benchmark. A reference point for sizing conviction against risk, not an instruction. Positions whose actual risk contribution exceeds ${S.maxRiskPct}% are flagged.</p>
         <div class="prl-sc"><table class="prl">
-          <thead><tr><th>Position</th><th>Own volatility</th><th>Current weight</th><th>Vol-targeted weight</th><th>Gap</th></tr></thead>
-          <tbody>${sized.map((s) => `<tr><td><b>${esc(s.sym)}</b></td><td>${pct(s.vol, 1)}</td><td>${pct(s.cur)}</td>
+          <thead><tr><th>Position</th><th>Own volatility</th><th>Risk contribution</th><th>Current weight</th><th>Equal-risk weight</th><th>Gap</th></tr></thead>
+          <tbody>${sized.map((s) => `<tr><td><b>${esc(s.sym)}</b></td><td>${pct(s.vol, 1)}</td>
+            <td style="color:${s.over ? P().crit : ''}">${pct(s.contrib, 1)}${s.over ? ' ⚑' : ''}</td>
+            <td>${pct(s.cur)}</td>
             <td>${s.sug === null ? '—' : pct(s.sug)}</td>
-            <td style="color:${s.sug !== null && s.cur > s.sug * 1.5 ? P().crit : ''}">${s.sug === null ? '—' : (s.cur > s.sug ? '+' : '') + pct(s.cur - s.sug)}</td></tr>`).join('')}</tbody>
+            <td style="color:${s.sug !== null && Math.abs(s.cur - s.sug) > 0.08 ? P().crit : ''}">${s.sug === null ? '—' : (s.cur > s.sug ? '+' : '') + pct(s.cur - s.sug)}</td></tr>`).join('')}</tbody>
         </table></div>
       </div>`;
   }
@@ -1425,8 +1488,8 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
           <select class="prl-in st" data-k="freq">
             ${['auto', 'weekly', 'daily'].map((f) => `<option ${f === s.freq ? 'selected' : ''}>${f}</option>`).join('')}
           </select></label>
-        <label class="prl-mut">Risk budget per position (%)
-          <input class="prl-in st" data-k="volTargetPct" value="${esc(s.volTargetPct)}"></label>
+        <label class="prl-mut">Max risk share per position (%)
+          <input class="prl-in st" data-k="maxRiskPct" value="${esc(s.maxRiskPct)}"></label>
         <label class="prl-mut">Price cache TTL (hours)
           <input class="prl-in st" data-k="barsTtlHours" value="${esc(s.barsTtlHours)}"></label>
       </div>
@@ -1543,7 +1606,7 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
       root.querySelectorAll('.st').forEach((i) => {
         const k = i.dataset.k;
         const v = i.value.trim();
-        patch[k] = ['years', 'volTargetPct', 'barsTtlHours'].includes(k) ? (Number(v) || DEFAULTS[k]) : v;
+        patch[k] = ['years', 'maxRiskPct', 'barsTtlHours'].includes(k) ? (Number(v) || DEFAULTS[k]) : v;
       });
       patch.years = clamp(Math.round(patch.years), 1, 25);
       saveSettings(patch);
