@@ -1,5 +1,56 @@
 # Changelog
 
+## v1.1.0 — 2026-08-06
+
+An adversarial pass with synthetic data — constant prices, identical assets,
+two-week histories, forty positions, hostile text in the notes field. Real
+market data cannot test these; it is too well-behaved. Six real defects, one of
+them data-loss.
+
+### Fixed
+
+- **Refresh destroyed the price cache.** It cleared every cached series *before*
+  attempting to refetch, so refreshing while offline — or while rate-limited,
+  which a refresh is the burst most likely to cause — wiped exactly the data the
+  cache exists to preserve. Forced refresh now bypasses the TTL instead, keeping
+  stale rows as a fallback and flagging them.
+- **Rows with a missing, zero, negative or non-numeric share count vanished
+  silently.** A position that disappears reads as "I don't own that", which is
+  the most expensive kind of wrong in a risk tool. They are now named in a
+  warning.
+- **Duplicate tickers were double-counted.** Two rows of one symbol are now
+  merged, with a warning. Left alone they also entered the covariance matrix as
+  a perfectly-correlated pair and distorted the shrinkage target.
+- **Spreadsheet formula injection on CSV export.** A thesis note beginning with
+  `=`, `+`, `-` or `@` executes when the exported file is opened in Excel or
+  Sheets. Such values are now prefixed with an apostrophe.
+- **Symbol- and currency-keyed lookups used plain objects**, so an inherited
+  property could answer as though it were real data. They are null-prototype
+  now. Ticker strings like `CONSTRUCTOR` are legitimate and remain accepted —
+  the fix is in the lookup, not a blocklist.
+- **"Insufficient history" was shown for a one-position portfolio**, when the
+  real reason is that correlation and risk contribution need at least two
+  holdings. The two cases now say what they mean.
+
+### Verified, not changed
+
+Independent recomputation confirmed the maths. Risk contributions match a
+numerical derivative of portfolio volatility to 4e-8. Ledoit-Wolf shrinkage
+falls monotonically as observations accumulate (δ 0.104 → 0.022 → 0.003 for
+T = 30 → 150 → 1500) and correctly goes to 1.0 on uncorrelated noise, where the
+constant-correlation target is exactly right. Max drawdown, ISO week grouping
+across a year boundary, and window trimming all match hand calculations.
+
+Constant-price assets, perfectly identical assets (a singular covariance
+matrix), unfetchable symbols and 40-position books all produce clean output with
+no `NaN`, `undefined` or `Infinity` leaking into the page. Hostile text in a
+note is escaped.
+
+### Added
+
+`test/adversarial.test.mjs` — 49 checks against a deterministic fake data
+source, so degenerate cases can be driven on demand.
+
 ## v1.0.1 — 2026-08-06
 
 Four fixes, all found by rendering the overlay over a live stockanalysis page

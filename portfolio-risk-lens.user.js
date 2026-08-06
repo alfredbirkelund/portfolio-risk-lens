@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Portfolio Risk Lens
 // @namespace    https://github.com/alfredbirkelund/portfolio-risk-lens
-// @version      1.0.1
+// @version      1.1.0
 // @description  Portfolio construction and risk management overlay for stockanalysis.com. Correlation, risk contribution, currency/sector exposure with ETF look-through, scenario sandbox and vol-targeted sizing. All data stays on your machine.
 // @author       Alfred Birkelund
 // @license      MIT
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.1';
+  const VERSION = '1.1.0';
 
   // ==========================================================================
   // 1. CONFIG
@@ -551,21 +551,51 @@
   // 7. RISK ENGINE
   // ==========================================================================
 
-  async function analyse(onProgress = () => {}) {
+  async function analyse(onProgress = () => {}, force = false) {
     const S = settings();
-    const pos = positions().filter((p) => p.sym && Number(p.shares) > 0);
-    if (!pos.length) return { empty: true };
+
+    // Rows the user typed that cannot be used must be *named*, not quietly
+    // dropped. A position that silently vanishes reads as "I don't own that",
+    // which is the most expensive kind of wrong in a risk tool.
+    const invalid = [];
+    const merged = [];
+    const byIndex = new Map();
+    for (const p of positions()) {
+      const sym = String(p.sym || '').trim().toUpperCase();
+      if (!sym) continue;
+      const n = Number(p.shares);
+      if (!isFinite(n) || n <= 0) {
+        invalid.push(`${sym} (shares "${String(p.shares || '').slice(0, 12)}")`);
+        continue;
+      }
+      if (byIndex.has(sym)) {
+        // Two rows of one ticker is one position. Keeping both would also put a
+        // perfectly-correlated pair into the covariance matrix and distort it.
+        const e = merged[byIndex.get(sym)];
+        e.shares = String(Number(e.shares) + n);
+        e.note = e.note || p.note;
+        e.duplicated = true;
+      } else {
+        byIndex.set(sym, merged.length);
+        merged.push(Object.assign({}, p, { sym, shares: String(n) }));
+      }
+    }
+    const duplicates = merged.filter((p) => p.duplicated).map((p) => p.sym);
+    const pos = merged;
+    if (!pos.length) return { empty: true, invalid, failures: [] };
 
     const syms = pos.map((p) => p.sym);
     const wanted = syms.concat([S.benchmark]);
 
     // --- fetch bars -------------------------------------------------------
-    const barsBySym = {};
+    // Null-prototype: these are keyed by user-supplied symbols and vendor
+    // currency codes, so an inherited property must never masquerade as a hit.
+    const barsBySym = Object.create(null);
     const failures = [];
     for (let i = 0; i < wanted.length; i++) {
       const s = wanted[i];
       onProgress(`prices ${i + 1}/${wanted.length} · ${s}`);
-      try { barsBySym[s] = await Cache.bars(s); }
+      try { barsBySym[s] = await Cache.bars(s, { force }); }
       catch (e) { failures.push({ sym: s, why: String(e.message || e) }); }
     }
     const live = pos.filter((p) => barsBySym[p.sym]);
@@ -573,10 +603,10 @@
 
     // --- fx ---------------------------------------------------------------
     const currencies = Array.from(new Set(live.map((p) => barsBySym[p.sym].currency)));
-    const fx = {};
+    const fx = Object.create(null);
     for (const c of currencies) {
       onProgress(`fx · ${c}`);
-      try { fx[c] = await Cache.fx(c); }
+      try { fx[c] = await Cache.fx(c, { force }); }
       catch (e) { failures.push({ sym: 'USD' + c + '=X', why: String(e.message || e) }); }
     }
     const baseFx = S.base === 'USD' ? { map: null } : (fx[S.base] || await Cache.fx(S.base).catch(() => ({ map: null })));
@@ -586,7 +616,7 @@
     // versa — so requiring an exact date hit would silently drop conversions
     // and leave prices in their local currency. A KRW price treated as DKK
     // does not look wrong on screen; it just makes every weight a lie.
-    const fxIndex = {};
+    const fxIndex = Object.create(null);
     const indexOf = (cur) => {
       if (fxIndex[cur] !== undefined) return fxIndex[cur];
       const map = fx[cur] && fx[cur].map;
@@ -634,7 +664,7 @@
     // --- meta (optional) ---------------------------------------------------
     // Enrichment only, but its failure must still be visible: silently showing
     // every holding as sector "Unknown" would look like real data.
-    const metaBySym = {};
+    const metaBySym = Object.create(null);
     let metaFailed = 0;
     for (let i = 0; i < live.length; i++) {
       onProgress(`profile ${i + 1}/${live.length}`);
@@ -741,7 +771,7 @@
         meta: metaBySym[p.sym] || {}
       })),
       total, risk, exposures, failures,
-      warnings: buildWarnings(live, barsBySym, metaFailed, unconverted)
+      warnings: buildWarnings(live, barsBySym, metaFailed, unconverted, invalid, duplicates)
     };
   }
 
@@ -838,8 +868,14 @@
     };
   }
 
-  function buildWarnings(live, barsBySym, metaFailed, unconverted) {
+  function buildWarnings(live, barsBySym, metaFailed, unconverted, invalid, duplicates) {
     const out = [];
+    if (invalid && invalid.length) {
+      out.push(`Ignored ${invalid.length} row(s) with a missing or non-positive share count: ${invalid.join(', ')}. Fix the share count to include them.`);
+    }
+    if (duplicates && duplicates.length) {
+      out.push(`Combined duplicate rows for ${duplicates.join(', ')} into one position each. Two rows of one ticker would also have entered the correlation matrix as a perfectly-correlated pair and distorted it.`);
+    }
     if (unconverted && unconverted.length) {
       out.push(`No exchange rate available for ${unconverted.join(', ')} — these positions are excluded from weights and totals rather than counted in the wrong currency.`);
     }
@@ -944,7 +980,12 @@
 
   function positionsToCSV(pos) {
     const q = (v) => {
-      const s = String(v == null ? '' : v);
+      let s = String(v == null ? '' : v);
+      // Neutralise spreadsheet formula injection. Excel and Sheets execute any
+      // cell beginning with = + - @ or a control character, so an exported
+      // thesis note is an attack surface the moment the file is opened. The
+      // leading apostrophe is stripped again by the numeric parser on import.
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
       return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     return ['symbol,shares,cost,target,note']
@@ -1298,7 +1339,12 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
   }
 
   function riskHTML(r) {
-    if (!r.risk) return warnBlock(r) + `<div class="prl-card"><h2>Risk</h2><p class="sub prl-na">Insufficient history for risk statistics. Add more positions or widen the lookback.</p></div>`;
+    if (!r.risk) {
+      const why = r.positions.length < 2
+        ? 'Correlation, risk contribution and portfolio volatility all describe how holdings interact, so they need <b>at least two positions</b>. Add another holding.'
+        : `Only ${r.obs} ${r.freq} observations — fewer than the ${MIN_OBS[r.freq]} required. Widen the lookback, or wait for more history on the newest holding.`;
+      return warnBlock(r) + `<div class="prl-card"><h2>Risk</h2><p class="sub">${why}</p></div>`;
+    }
     const k = r.risk;
     const labels = r.positions.map((p) => p.sym);
     const contrib = r.positions.map((p, i) => ({ k: p.sym, v: k.contrib[i] }))
@@ -1657,12 +1703,17 @@ NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
   async function run(force) {
     STATE.busy = true; render();
     try {
-      if (force) Cache.clearPrices();
+      // Deliberately NOT Cache.clearPrices() here. Refresh used to wipe every
+      // cached series before trying to refetch, so a refresh while offline —
+      // or while rate-limited, which a refresh is precisely the burst most
+      // likely to cause — destroyed the data the cache exists to preserve.
+      // `force` now bypasses the TTL instead; Cache.bars keeps the old rows as
+      // a fallback and flags them stale if the refetch fails.
       STATE.result = await analyse((m) => {
         STATE.msg = m;
         const b = document.getElementById('prl-body');
         if (b && !STATE.result) b.innerHTML = `<div class="prl-card"><p class="sub">Loading… ${esc(m)}</p></div>`;
-      });
+      }, force);
     } catch (e) {
       console.error('[PRL]', e);
       STATE.result = { empty: true, failures: [{ sym: '—', why: String(e.message || e) }] };

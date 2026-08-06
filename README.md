@@ -180,10 +180,16 @@ portfolio — US + Japan + Korea + Denmark + a UCITS ETF; five currencies, three
 non-overlapping trading sessions.
 
 ```bash
-node test/engine.test.mjs        # 20 checks on the maths
-node test/csv.test.mjs           # 21 checks on import parsing
-node test/ui.render.mjs out.html # 33 checks end to end, writes a preview
+node test/engine.test.mjs         # 20 checks on the maths, live data
+node test/csv.test.mjs            # 21 checks on import parsing
+node test/ui.render.mjs out.html  # 38 checks end to end, writes a preview
+node test/adversarial.test.mjs    # 49 checks on degenerate and hostile input
 ```
+
+The adversarial suite runs against a deterministic fake data source rather than
+the market, because the cases worth testing are ones real data never produces: a
+constant price, two perfectly identical assets, a two-week history, forty
+positions, `<script>` in a thesis note, a refresh that fails while offline.
 
 Euler's theorem (risk contributions sum to 1.000000000000), positive semi-definiteness via
 Cholesky, shrinkage bounds, weekly-resample integrity, and that diversification actually
