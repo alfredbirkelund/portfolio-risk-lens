@@ -232,6 +232,11 @@ cheapest way to catch a unit error is to convert back and see if you land where 
 
 ---
 
+## Where this goes next
+
+[NEXT-STEPS.md](NEXT-STEPS.md) — what is untested, what is worth building, what was
+deliberately left out, and two mistakes documented so they are not repeated.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
