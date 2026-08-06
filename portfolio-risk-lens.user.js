@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Portfolio Risk Lens
 // @namespace    https://github.com/alfredbirkelund/portfolio-risk-lens
-// @version      0.1.0
+// @version      1.0.0
 // @description  Portfolio construction and risk management overlay for stockanalysis.com. Correlation, risk contribution, currency/sector exposure with ETF look-through, scenario sandbox and vol-targeted sizing. All data stays on your machine.
 // @author       Alfred Birkelund
 // @license      MIT
@@ -15,6 +15,7 @@
 // @connect      query1.finance.yahoo.com
 // @connect      query2.finance.yahoo.com
 // @connect      fc.yahoo.com
+// @connect      stockanalysis.com
 // @run-at       document-idle
 // @noframes
 // @updateURL    https://raw.githubusercontent.com/alfredbirkelund/portfolio-risk-lens/main/portfolio-risk-lens.user.js
@@ -25,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '1.0.0';
 
   // ==========================================================================
   // 1. CONFIG
@@ -95,10 +96,42 @@
     });
   }
 
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+  /**
+   * Yahoo rate-limits on burst, not on volume. A portfolio refresh is a burst
+   * of thirty-odd requests, so without pacing a user who hits Refresh twice
+   * gets a wall of 429s and concludes the tool is broken. One in-flight
+   * request at a time, a small gap between them, and exponential backoff on
+   * 429/5xx keeps a normal refresh comfortably inside the limit.
+   */
+  const POLITE_GAP_MS = 120;
+  const MAX_ATTEMPTS = 4;
+  let queue = Promise.resolve();
+
+  function enqueue(fn) {
+    const next = queue.then(fn, fn);
+    queue = next.then(() => sleep(POLITE_GAP_MS), () => sleep(POLITE_GAP_MS));
+    return next;
+  }
+
   async function getJSON(url, opts) {
-    const r = await httpGet(url, opts);
-    if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status + ' for ' + url);
-    try { return JSON.parse(r.text); } catch (e) { throw new Error('bad JSON from ' + url); }
+    return enqueue(async () => {
+      let wait = 900;
+      for (let attempt = 1; ; attempt++) {
+        const r = await httpGet(url, opts);
+        if (r.status >= 200 && r.status < 300) {
+          try { return JSON.parse(r.text); }
+          catch (e) { throw new Error('bad JSON from ' + url); }
+        }
+        const retryable = r.status === 429 || r.status >= 500;
+        if (!retryable || attempt >= MAX_ATTEMPTS) {
+          throw new Error('HTTP ' + r.status + (r.status === 429 ? ' (rate limited — wait a minute and refresh)' : '') + ' for ' + url);
+        }
+        await sleep(wait);
+        wait *= 2;
+      }
+    });
   }
 
   // ==========================================================================
@@ -115,8 +148,8 @@
     async crumb() {
       if (this._crumb) return this._crumb;
       // Priming call sets the cookie GM_xmlhttpRequest will send back.
-      try { await httpGet('https://fc.yahoo.com', { timeout: 12000 }); } catch (e) { /* expected to 404 */ }
-      const r = await httpGet('https://query2.finance.yahoo.com/v1/test/getcrumb', { timeout: 12000 });
+      try { await enqueue(() => httpGet('https://fc.yahoo.com', { timeout: 12000 })); } catch (e) { /* expected to 404 */ }
+      const r = await enqueue(() => httpGet('https://query2.finance.yahoo.com/v1/test/getcrumb', { timeout: 12000 }));
       const c = (r.text || '').trim();
       if (!c || c.length > 32 || /[<>]/.test(c)) throw new Error('no crumb');
       this._crumb = c;
@@ -177,6 +210,38 @@
   };
 
   // ==========================================================================
+  // 4b. STOCKANALYSIS ADAPTER  (fallback price source)
+  //
+  //    Same origin as the page we run on, so no extra permission is needed.
+  //    Its history goes deeper than most paid feeds — AAPL back to 1982 — but
+  //    only US-listed symbols are addressable through this route, so it is a
+  //    fallback for the US sleeve rather than a general replacement.
+  // ==========================================================================
+
+  const StockAnalysis = {
+    supports: (symbol) => !/[.=^]/.test(symbol),   // plain US tickers only
+
+    async bars(symbol) {
+      if (!this.supports(symbol)) throw new Error('unsupported symbol');
+      const t = symbol.toLowerCase();
+      let j = null;
+      for (const kind of ['s', 'e']) {           // stock, then ETF
+        try {
+          j = await getJSON(`https://stockanalysis.com/api/symbol/${kind}/${t}/history?type=chart&range=10Y`);
+          if (j && j.status === 200 && Array.isArray(j.data) && j.data.length) break;
+          j = null;
+        } catch (e) { j = null; }
+      }
+      if (!j) throw new Error('no stockanalysis data for ' + symbol);
+      const rows = j.data
+        .filter((d) => Array.isArray(d) && isFinite(d[1]))
+        .map((d) => [isoDay(d[0]), d[1]]);
+      if (!rows.length) throw new Error('empty stockanalysis series for ' + symbol);
+      return { currency: 'USD', rows };
+    }
+  };
+
+  // ==========================================================================
   // 5. CACHE  — the cache is the source of truth. Yahoo is only ever consulted
   //    for bars we do not already have. If every endpoint died tomorrow the
   //    tool still runs on everything ever loaded.
@@ -188,15 +253,23 @@
       const hit = Store.get(key, null);
       const ttl = settings().barsTtlHours * 3600e3;
       if (!force && hit && (Date.now() - hit.fetched) < ttl) return hit;
-      try {
-        const fresh = await Yahoo.bars(symbol, settings().years);
-        const rec = { fetched: Date.now(), currency: fresh.currency, rows: fresh.rows, stale: false };
-        Store.set(key, rec);
-        return rec;
-      } catch (e) {
-        if (hit) return Object.assign({}, hit, { stale: true, error: String(e.message || e) });
-        throw e;
+
+      // Tier 1: Yahoo. Tier 2: stockanalysis (US only). Tier 3: whatever is
+      // already cached, flagged stale. The tool degrades; it does not stop.
+      const tried = [];
+      for (const src of [
+        { name: 'yahoo', get: () => Yahoo.bars(symbol, settings().years) },
+        { name: 'stockanalysis', get: () => StockAnalysis.bars(symbol) }
+      ]) {
+        try {
+          const fresh = await src.get();
+          const rec = { fetched: Date.now(), currency: fresh.currency, rows: fresh.rows, source: src.name, stale: false };
+          Store.set(key, rec);
+          return rec;
+        } catch (e) { tried.push(`${src.name}: ${e.message || e}`); }
       }
+      if (hit) return Object.assign({}, hit, { stale: true, error: tried.join(' | ') });
+      throw new Error(tried.join(' | '));
     },
 
     async meta(symbol, { force = false } = {}) {
@@ -494,19 +567,52 @@
     }
     const baseFx = S.base === 'USD' ? { map: null } : (fx[S.base] || await Cache.fx(S.base).catch(() => ({ map: null })));
 
+    // FX lookup must be as-of, not exact-match. Equity and FX series do not
+    // share a calendar — Seoul trades on days the FX series skips and vice
+    // versa — so requiring an exact date hit would silently drop conversions
+    // and leave prices in their local currency. A KRW price treated as DKK
+    // does not look wrong on screen; it just makes every weight a lie.
+    const fxIndex = {};
+    const indexOf = (cur) => {
+      if (fxIndex[cur] !== undefined) return fxIndex[cur];
+      const map = fx[cur] && fx[cur].map;
+      fxIndex[cur] = map ? { dates: Array.from(map.keys()).sort(), map } : null;
+      return fxIndex[cur];
+    };
+    if (S.base !== 'USD' && !fx[S.base] && baseFx && baseFx.map) fx[S.base] = baseFx;
+
+    /** Units of `cur` per 1 USD, as of `date` (nearest observation at or before). */
+    const rateAt = (cur, date) => {
+      if (cur === 'USD') return 1;
+      const ix = indexOf(cur);
+      if (!ix) return null;
+      const hit = ix.map.get(date);
+      if (hit) return hit;
+      const { dates } = ix;
+      let lo = 0, hi = dates.length - 1, best = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (dates[mid] <= date) { best = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      if (best < 0) best = 0;                       // before the FX series starts
+      return ix.map.get(dates[best]) || null;
+    };
+
+    const fxUnavailable = new Set();
+    const convert = (price, cur, date) => {
+      if (cur === S.base) return price;
+      const perLocal = rateAt(cur, date);
+      const perBase = rateAt(S.base, date);
+      if (!perLocal || !perBase) { fxUnavailable.add(cur); return null; }
+      return price * (1 / perLocal) * perBase;
+    };
+
     const toBase = (rows, cur) => {
       if (cur === S.base) return rows;
-      const from = fx[cur] && fx[cur].map;
-      const to = baseFx && baseFx.map;
-      let lastFrom = null, lastTo = null;
       const out = [];
       for (const [d, p] of rows) {
-        if (from) { const v = from.get(d); if (v) lastFrom = v; }
-        if (to) { const v = to.get(d); if (v) lastTo = v; }
-        const usdPerLocal = (cur === 'USD') ? 1 : (lastFrom ? 1 / lastFrom : null);
-        const basePerUsd = (S.base === 'USD') ? 1 : lastTo;
-        if (usdPerLocal === null || basePerUsd === null) continue;
-        out.push([d, p * usdPerLocal * basePerUsd]);
+        const v = convert(p, cur, d);
+        if (v !== null) out.push([d, v]);
       }
       return out;
     };
@@ -524,16 +630,22 @@
     }
 
     // --- weights -----------------------------------------------------------
+    const unconverted = [];
     const valueOf = (p) => {
       const rec = barsBySym[p.sym];
-      const last = rec.rows[rec.rows.length - 1][1];
-      const conv = toBase([[rec.rows[rec.rows.length - 1][0], last]], rec.currency);
-      const px = conv.length ? conv[0][1] : last;
+      const [lastDate, lastPx] = rec.rows[rec.rows.length - 1];
+      const px = convert(lastPx, rec.currency, lastDate);
+      if (px === null) {
+        // Refuse to mix currencies silently. The position is reported, but its
+        // value is withheld rather than quoted in the wrong unit.
+        unconverted.push(`${p.sym} (${rec.currency})`);
+        return null;
+      }
       return Number(p.shares) * px;
     };
     const values = live.map(valueOf);
-    const total = values.reduce((a, b) => a + b, 0);
-    const w = values.map((v) => (total > 0 ? v / total : 0));
+    const total = values.reduce((a, b) => a + (b || 0), 0);
+    const w = values.map((v) => (total > 0 && v ? v / total : 0));
 
     // --- align & returns ---------------------------------------------------
     const seriesList = live.map((p) => ({
@@ -610,11 +722,12 @@
       positions: live.map((p, i) => ({
         ...p, value: values[i], weight: w[i],
         currency: barsBySym[p.sym].currency,
+        source: barsBySym[p.sym].source,
         stale: barsBySym[p.sym].stale,
         meta: metaBySym[p.sym] || {}
       })),
       total, risk, exposures, failures,
-      warnings: buildWarnings(live, barsBySym, metaFailed)
+      warnings: buildWarnings(live, barsBySym, metaFailed, unconverted)
     };
   }
 
@@ -630,19 +743,43 @@
     return 'EMEA';
   }
 
-  /** Sector / country / currency exposure. Funds are decomposed, not counted as one line. */
+  /** Root symbol for cross-source matching: AAPL == AAPL, 7203.T == 7203. */
+  const rootSym = (s) => String(s || '').split('.')[0].toUpperCase();
+
+  const isFundMeta = (m) => m.type === 'ETF' || m.type === 'MUTUALFUND' ||
+    (m.sectorWeights || []).length > 0 || (m.holdings || []).length > 0;
+
+  /**
+   * Sector / country / currency exposure, plus security-level look-through.
+   *
+   * The look-through is the point of the whole exercise: if you hold a world
+   * tracker at 36% and Apple directly at 12%, your real Apple exposure is not
+   * 12% — it is 12% plus 4.76% of the tracker. Nothing in a holdings list
+   * shows you that, and it is exactly the concentration people get wrong.
+   */
   function buildExposures(live, w, metaBySym, barsBySym) {
     const sector = new Map(), country = new Map(), currency = new Map();
     const add = (m, k, v) => m.set(k || 'Unknown', (m.get(k || 'Unknown') || 0) + v);
 
+    // key -> { name, direct, indirect, via:Set }
+    const look = new Map();
+    const touch = (key, name) => {
+      if (!look.has(key)) look.set(key, { key, name: name || key, direct: 0, indirect: 0, via: new Set() });
+      const e = look.get(key);
+      if (name && (e.name === e.key)) e.name = name;
+      return e;
+    };
+
+    let unitemised = 0;   // fund weight not covered by the published top holdings
+
     live.forEach((p, i) => {
       const meta = metaBySym[p.sym] || {};
       add(currency, barsBySym[p.sym].currency, w[i]);
+      const fund = isFundMeta(meta);
 
-      const isFund = meta.type === 'ETF' || meta.type === 'MUTUALFUND' || (meta.sectorWeights || []).length;
-      if (isFund && (meta.sectorWeights || []).length) {
-        // Look-through: distribute the fund's weight across its sector mix so a
-        // world tracker is not scored as a single concentrated position.
+      if (fund && (meta.sectorWeights || []).length) {
+        // Distribute the fund's weight across its sector mix so a world tracker
+        // is not scored as one concentrated position.
         const sw = meta.sectorWeights.filter((s) => s.w > 0);
         const tot = sw.reduce((a, b) => a + b.w, 0) || 1;
         for (const s of sw) add(sector, s.sector, w[i] * (s.w / tot));
@@ -651,14 +788,47 @@
         add(sector, meta.sector, w[i]);
         add(country, meta.country, w[i]);
       }
+
+      if (fund && (meta.holdings || []).length) {
+        let covered = 0;
+        for (const h of meta.holdings) {
+          if (!(h.w > 0)) continue;
+          covered += h.w;
+          const e = touch(rootSym(h.sym || h.name), h.name || h.sym);
+          e.indirect += w[i] * h.w;
+          e.via.add(p.sym);
+        }
+        const rest = Math.max(0, 1 - covered);
+        unitemised += w[i] * rest;
+        if (rest > 0) {
+          const e = touch('~rest:' + p.sym, `Rest of ${p.sym} (not itemised)`);
+          e.indirect += w[i] * rest;
+          e.via.add(p.sym);
+        }
+      } else {
+        const e = touch(rootSym(p.sym), meta.name || p.sym);
+        e.direct += w[i];
+      }
     });
 
     const srt = (m) => Array.from(m, ([k, v]) => ({ k, v })).sort((a, b) => b.v - a.v);
-    return { sector: srt(sector), country: srt(country), currency: srt(currency) };
+    const lookthrough = Array.from(look.values())
+      .map((e) => ({ ...e, total: e.direct + e.indirect, via: Array.from(e.via) }))
+      .sort((a, b) => b.total - a.total);
+
+    return {
+      sector: srt(sector), country: srt(country), currency: srt(currency),
+      lookthrough, unitemised,
+      // names held both directly and inside a fund — the hidden concentration
+      overlaps: lookthrough.filter((e) => e.direct > 0 && e.indirect > 0)
+    };
   }
 
-  function buildWarnings(live, barsBySym, metaFailed) {
+  function buildWarnings(live, barsBySym, metaFailed, unconverted) {
     const out = [];
+    if (unconverted && unconverted.length) {
+      out.push(`No exchange rate available for ${unconverted.join(', ')} — these positions are excluded from weights and totals rather than counted in the wrong currency.`);
+    }
     if (metaFailed) {
       out.push(metaFailed === live.length
         ? 'Company profiles unavailable (the Yahoo crumb handshake failed) — sector and country show as Unknown and ETF look-through is off. Prices, correlation and every risk figure are unaffected.'
@@ -670,6 +840,110 @@
       if (rec.rows.length < 120) out.push(`${p.sym}: only ${rec.rows.length} daily observations`);
     }
     return out;
+  }
+
+  // ==========================================================================
+  // 7b. CSV IMPORT / EXPORT
+  //
+  //    Nobody types thirty positions by hand. Import has to survive whatever
+  //    the user's broker or spreadsheet emits — including the European
+  //    convention of semicolon delimiters with comma decimal separators, which
+  //    a naive split(',') turns into silent garbage.
+  // ==========================================================================
+
+  const CSV_FIELDS = ['sym', 'shares', 'cost', 'target', 'note'];
+  // Aliases are compared after stripping every non-a-z character, so Nordic
+  // headers appear here in both their transliterated and stripped forms
+  // ("Vægt" -> "vgt", "Vaegt" -> "vaegt"). Broker exports are the realistic
+  // import source and they are not in English.
+  const HEADER_ALIASES = {
+    sym: ['sym', 'symbol', 'ticker', 'yahoo', 'code', 'instrument', 'security',
+          'vrdipapir', 'vaerdipapir', 'papir', 'aktie', 'namn', 'navn', 'name'],
+    shares: ['shares', 'quantity', 'qty', 'units', 'amount', 'position', 'holding',
+             'antal', 'antall', 'stk', 'stykk', 'anzahl'],
+    cost: ['cost', 'costbasis', 'price', 'avgprice', 'averageprice', 'buyprice',
+           'unitcost', 'gak', 'kurs', 'kjopskurs', 'kobskurs', 'anskaffelseskurs', 'preis'],
+    target: ['target', 'targetweight', 'targetpct', 'targetallocation', 'weight',
+             'allocation', 'maal', 'ml', 'vgt', 'vaegt', 'vekt', 'vikt', 'andel'],
+    note: ['note', 'notes', 'thesis', 'comment', 'remark', 'kommentar', 'notat', 'anmerkung']
+  };
+
+  function parseCSV(text) {
+    const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim());
+    if (!lines.length) return { rows: [], error: 'empty input' };
+
+    // Delimiter: whichever is more common in the first line.
+    const head = lines[0];
+    const semi = (head.match(/;/g) || []).length;
+    const comma = (head.match(/,/g) || []).length;
+    const tab = (head.match(/\t/g) || []).length;
+    const delim = tab > Math.max(semi, comma) ? '\t' : (semi > comma ? ';' : ',');
+    // With semicolon delimiters, commas are decimal separators.
+    const decimalComma = delim === ';';
+
+    const split = (line) => {
+      const out = []; let cur = '', q = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        if (c === '"') { if (q && line[i + 1] === '"') { cur += '"'; i++; } else q = !q; }
+        else if (c === delim && !q) { out.push(cur); cur = ''; }
+        else cur += c;
+      }
+      out.push(cur);
+      return out.map((s) => s.trim());
+    };
+
+    const norm = (s) => s.toLowerCase().replace(/[^a-z]/g, '');
+    const first = split(lines[0]);
+    const mapped = first.map((h) => {
+      const n = norm(h);
+      return CSV_FIELDS.find((f) => HEADER_ALIASES[f].includes(n)) || null;
+    });
+    const hasHeader = mapped.filter(Boolean).length >= 2;
+    const cols = hasHeader ? mapped : CSV_FIELDS.slice(0, first.length);
+
+    const numeric = (v) => {
+      if (v == null) return '';
+      let s = String(v).replace(/[^\d.,\-]/g, '');
+      if (!s) return '';
+      if (decimalComma) s = s.replace(/\./g, '').replace(',', '.');
+      else if ((s.match(/,/g) || []).length && !/\.\d/.test(s)) s = s.replace(/,/g, '');
+      else s = s.replace(/,/g, '');
+      return s;
+    };
+
+    const rows = [];
+    const skipped = [];
+    for (const line of lines.slice(hasHeader ? 1 : 0)) {
+      const cells = split(line);
+      const o = { sym: '', shares: '', cost: '', target: '', note: '' };
+      cols.forEach((f, i) => { if (f && cells[i] !== undefined) o[f] = cells[i]; });
+      o.sym = (o.sym || '').replace(/^["']|["']$/g, '').toUpperCase();
+      o.shares = numeric(o.shares);
+      o.cost = numeric(o.cost);
+      o.target = numeric(o.target);
+      if (!o.sym || !/^[A-Z0-9][A-Z0-9.\-=^]*$/.test(o.sym)) { skipped.push(line); continue; }
+      rows.push(o);
+    }
+    return { rows, skipped, delim, hasHeader, decimalComma };
+  }
+
+  function positionsToCSV(pos) {
+    const q = (v) => {
+      const s = String(v == null ? '' : v);
+      return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    return ['symbol,shares,cost,target,note']
+      .concat(pos.map((p) => CSV_FIELDS.map((f) => q(p[f])).join(',')))
+      .join('\n');
+  }
+
+  function download(name, text, mime) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: mime || 'text/plain' }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
   // ==========================================================================
@@ -753,6 +1027,9 @@
     .prl-lg{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:${p.ink2};margin-top:10px}
     .prl-lg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
     .prl-sc{overflow-x:auto}
+    textarea.prl-in{font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical}
+    label.prl-mut{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+    label.prl-mut .prl-in{margin-top:4px;text-transform:none;font-size:13px}
     .prl-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
     .prl-mut{color:${p.muted};font-size:12px}
     `;
@@ -954,6 +1231,21 @@
       <div class="prl-row" style="margin-top:12px">
         <button class="prl-bt" id="prl-add">Add row</button>
         <button class="prl-bt pri" id="prl-save">Save &amp; recompute</button>
+        <span style="flex:1"></span>
+        <button class="prl-bt" id="prl-csvin">Import CSV</button>
+        <button class="prl-bt" id="prl-csvout">Export CSV</button>
+      </div>
+      <div id="prl-csvbox" style="display:none;margin-top:12px">
+        <p class="sub">Paste rows below, or drop a file. Columns are detected from the header — <code>symbol, shares, cost, target, note</code> in any order. Comma, semicolon and tab delimiters all work, including semicolon files that use commas as decimal separators.</p>
+        <textarea id="prl-csvtext" class="prl-in" rows="7" placeholder="symbol,shares,cost,target,note
+AAPL,40,150,22,Services margin
+NOVO-B.CO,120,620,18,GLP-1 capacity"></textarea>
+        <div class="prl-row" style="margin-top:10px">
+          <input type="file" id="prl-csvfile" accept=".csv,.txt,text/csv" style="font:12px system-ui">
+          <button class="prl-bt pri" id="prl-csvgo">Import</button>
+          <button class="prl-bt" id="prl-csvcancel">Cancel</button>
+          <span class="prl-mut" id="prl-csvmsg"></span>
+        </div>
       </div>`;
   }
 
@@ -996,6 +1288,8 @@
         <p class="sub">What today's book would have done historically. Shaded band is the deepest drawdown.</p>
         ${lineSVG(k.rp, k.dates, k.dd.from, k.dd.at)}
       </div>
+
+      ${lookthroughHTML(r)}
 
       <div class="prl-card">
         <h2>Exposure</h2>
@@ -1063,6 +1357,35 @@
       </div>`;
   }
 
+  /** True security-level exposure once funds are seen through. */
+  function lookthroughHTML(r) {
+    const lt = (r.exposures.lookthrough || []).filter((e) => e.total > 0.0005 && !/^~rest:/.test(e.key));
+    const ov = r.exposures.overlaps || [];
+    if (!lt.length) return '';
+
+    const top = lt.slice(0, 14);
+    const rest = r.exposures.unitemised || 0;
+
+    const overlapNote = ov.length
+      ? `<div class="prl-note">${ov.map((e) => `You hold <b>${esc(e.name)}</b> at ${pct(e.direct)} directly, plus ${pct(e.indirect)} inside ${esc(e.via.join(', '))} — a true exposure of <b>${pct(e.total)}</b>, ${(e.total / Math.max(e.direct, 1e-9)).toFixed(1)}× what the holdings list shows.`).join('<br>')}</div>`
+      : `<p class="sub">No holding overlaps with your funds' published top holdings.</p>`;
+
+    return `<div class="prl-card">
+      <h2>Look-through exposure</h2>
+      <p class="sub">Real exposure to each underlying company, combining what you hold directly with what your funds hold on your behalf.</p>
+      ${overlapNote}
+      <div class="prl-sc"><table class="prl">
+        <thead><tr><th>Company</th><th>Direct</th><th>Via funds</th><th>True exposure</th></tr></thead>
+        <tbody>${top.map((e) => `<tr>
+          <td><b>${esc(e.name)}</b>${e.via.length ? `<div class="prl-mut">via ${esc(e.via.join(', '))}</div>` : ''}</td>
+          <td>${e.direct > 0 ? pct(e.direct) : '<span class="prl-na">—</span>'}</td>
+          <td>${e.indirect > 0 ? pct(e.indirect) : '<span class="prl-na">—</span>'}</td>
+          <td style="font-weight:600${e.direct > 0 && e.indirect > 0 ? ';color:' + P().crit : ''}">${pct(e.total)}</td>
+        </tr>`).join('')}</tbody></table></div>
+      ${rest > 0.005 ? `<p class="sub" style="margin-top:10px">${pct(rest, 0)} of the portfolio sits in fund holdings beyond the published top-10 and is not itemised here. Those positions are counted in sector and currency exposure, just not name by name.</p>` : ''}
+    </div>`;
+  }
+
   const STRESS = [
     { name: 'COVID crash', from: '2020-02-19', to: '2020-03-23' },
     { name: '2022 rate shock', from: '2022-01-03', to: '2022-10-14' },
@@ -1089,7 +1412,32 @@
   function dataHTML(r) {
     const st = Cache.stats();
     const s = settings();
+    const sources = r && r.positions ? [...new Set(r.positions.map((p) => p.source || 'cache'))] : [];
     return `<div class="prl-card">
+      <h2>Settings</h2>
+      <p class="sub">Changes take effect on the next recompute.</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;max-width:840px">
+        <label class="prl-mut">Benchmark
+          <input class="prl-in st" data-k="benchmark" value="${esc(s.benchmark)}"></label>
+        <label class="prl-mut">History (years)
+          <input class="prl-in st" data-k="years" value="${esc(s.years)}"></label>
+        <label class="prl-mut">Return sampling
+          <select class="prl-in st" data-k="freq">
+            ${['auto', 'weekly', 'daily'].map((f) => `<option ${f === s.freq ? 'selected' : ''}>${f}</option>`).join('')}
+          </select></label>
+        <label class="prl-mut">Risk budget per position (%)
+          <input class="prl-in st" data-k="volTargetPct" value="${esc(s.volTargetPct)}"></label>
+        <label class="prl-mut">Price cache TTL (hours)
+          <input class="prl-in st" data-k="barsTtlHours" value="${esc(s.barsTtlHours)}"></label>
+      </div>
+      <div class="prl-row" style="margin-top:14px">
+        <button class="prl-bt pri" id="prl-setsave">Save settings</button>
+        <span class="prl-mut" id="prl-setmsg"></span>
+      </div>
+      <p class="sub" style="margin-top:12px">Sampling <b>auto</b> picks weekly whenever the portfolio spans trading regions, because daily closes in Tokyo, Seoul and New York are not simultaneous and would understate cross-region correlation. Override only if you know why you want to.</p>
+    </div>
+
+    <div class="prl-card">
       <h2>Data &amp; diagnostics</h2>
       <p class="sub">Everything is stored in your browser by the userscript manager. Nothing is uploaded anywhere.</p>
       <table class="prl" style="max-width:520px">
@@ -1098,7 +1446,7 @@
           <tr><td style="text-align:left">Cached profiles</td><td>${st.meta}</td></tr>
           <tr><td style="text-align:left">Local storage used</td><td>${st.kb} KB</td></tr>
           <tr><td style="text-align:left">Return sampling</td><td>${r && r.freq ? r.freq : '—'}</td></tr>
-          <tr><td style="text-align:left">Benchmark</td><td>${esc(s.benchmark)}</td></tr>
+          <tr><td style="text-align:left">Price sources in use</td><td>${esc(sources.join(', ') || '—')}</td></tr>
         </tbody></table>
       <div class="prl-row" style="margin-top:14px">
         <button class="prl-bt" id="prl-selftest">Run self-test</button>
@@ -1154,6 +1502,55 @@
     });
     if ($('#prl-screset')) $('#prl-screset').addEventListener('click', () => { STATE.scenario = null; render(); });
 
+    // --- CSV ---------------------------------------------------------------
+    const box = $('#prl-csvbox');
+    if ($('#prl-csvin')) $('#prl-csvin').addEventListener('click', () => {
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+    });
+    if ($('#prl-csvcancel')) $('#prl-csvcancel').addEventListener('click', () => { box.style.display = 'none'; });
+    if ($('#prl-csvout')) $('#prl-csvout').addEventListener('click', () => {
+      download('portfolio-risk-lens-positions.csv', positionsToCSV(positions()), 'text/csv');
+    });
+    if ($('#prl-csvfile')) $('#prl-csvfile').addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = () => { $('#prl-csvtext').value = fr.result; };
+      fr.readAsText(f);
+    });
+    if ($('#prl-csvgo')) $('#prl-csvgo').addEventListener('click', () => {
+      const parsed = parseCSV($('#prl-csvtext').value);
+      const msg = $('#prl-csvmsg');
+      if (!parsed.rows.length) {
+        msg.innerHTML = `<span style="color:${P().crit}">Nothing importable found${parsed.skipped && parsed.skipped.length ? ` — ${parsed.skipped.length} line(s) had no usable symbol` : ''}.</span>`;
+        return;
+      }
+      // Merge on symbol rather than replacing, so an import tops up a portfolio
+      // instead of silently destroying rows the file happens not to mention.
+      const cur = positions();
+      const byS = new Map(cur.map((p) => [p.sym, p]));
+      for (const row of parsed.rows) byS.set(row.sym, Object.assign({}, byS.get(row.sym) || {}, row));
+      savePositions(Array.from(byS.values()));
+      const skipped = (parsed.skipped || []).length;
+      msg.textContent = `Imported ${parsed.rows.length} (${parsed.delim === ';' ? 'semicolon' : parsed.delim === '\t' ? 'tab' : 'comma'}-delimited` +
+        `${parsed.decimalComma ? ', decimal comma' : ''})${skipped ? `, skipped ${skipped}` : ''}.`;
+      setTimeout(() => run(false), 400);
+    });
+
+    // --- settings ----------------------------------------------------------
+    if ($('#prl-setsave')) $('#prl-setsave').addEventListener('click', () => {
+      const patch = {};
+      root.querySelectorAll('.st').forEach((i) => {
+        const k = i.dataset.k;
+        const v = i.value.trim();
+        patch[k] = ['years', 'volTargetPct', 'barsTtlHours'].includes(k) ? (Number(v) || DEFAULTS[k]) : v;
+      });
+      patch.years = clamp(Math.round(patch.years), 1, 25);
+      saveSettings(patch);
+      $('#prl-setmsg').textContent = 'Saved. Recomputing…';
+      setTimeout(() => run(true), 300);
+    });
+
     if ($('#prl-selftest')) $('#prl-selftest').addEventListener('click', selfTest);
     if ($('#prl-export')) $('#prl-export').addEventListener('click', exportAll);
     if ($('#prl-clear')) $('#prl-clear').addEventListener('click', () => {
@@ -1188,12 +1585,8 @@
   function exportAll() {
     const dump = { version: VERSION, exported: new Date().toISOString(), settings: settings(), positions: positions(), cache: {} };
     for (const k of Store.keys()) if (k.indexOf('bars:') === 0 || k.indexOf('meta:') === 0) dump.cache[k] = Store.get(k, null);
-    const blob = new Blob([JSON.stringify(dump, null, 1)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'portfolio-risk-lens-' + new Date().toISOString().slice(0, 10) + '.json';
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    download('portfolio-risk-lens-' + new Date().toISOString().slice(0, 10) + '.json',
+      JSON.stringify(dump, null, 1), 'application/json');
   }
 
   // ---- orchestration -------------------------------------------------------

@@ -66,7 +66,8 @@ const ctx = {
 
 const api = new Function(...Object.keys(ctx), body + `
   return { analyse, settings, saveSettings, savePositions, positions,
-           positionsHTML, riskHTML, scenariosHTML, dataHTML, css, STATE, P };`
+           positionsHTML, riskHTML, scenariosHTML, dataHTML, css, STATE, P,
+           StockAnalysis, Yahoo };`
 )(...Object.values(ctx));
 
 // ---- the awkward portfolio ------------------------------------------------
@@ -92,8 +93,68 @@ check('no fetch failures', !r.failures.length, r.failures.map((f) => f.sym).join
 check('weekly sampling auto-selected', r.freq === 'weekly', r.freq);
 check('risk block computed', !!r.risk);
 check('weights sum to 1', Math.abs(r.positions.reduce((s, p) => s + p.weight, 0) - 1) < 1e-9);
+check('no currency left unconverted', !r.warnings.some((w) => /No exchange rate/.test(w)),
+  r.warnings.find((w) => /No exchange rate/.test(w)) || 'all converted');
+
+/*
+ * Weights summing to 1 proves nothing — they are normalised, so a KRW price
+ * mistakenly treated as DKK still sums to 1 while making every weight wrong.
+ * The real check is that no single position dominates through unit confusion:
+ * these five holdings were sized to be broadly comparable in value, so any
+ * weight above 60% means a currency was not converted.
+ */
+const maxW = Math.max(...r.positions.map((p) => p.weight));
+check('no position dominates through unit confusion', maxW < 0.6,
+  `largest weight ${(maxW * 100).toFixed(1)}% (${r.positions.find((p) => p.weight === maxW).sym})`);
+
+// Cross-check one conversion against an independent spot rate.
+{
+  const jp = r.positions.find((p) => p.sym === '7203.T');
+  const fxr = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/USDDKK=X?range=5d&interval=1d')
+    .then((x) => x.json()).catch(() => null);
+  const jpy = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/USDJPY=X?range=5d&interval=1d')
+    .then((x) => x.json()).catch(() => null);
+  if (jp && fxr && jpy) {
+    const px = (j) => (j.chart.result[0].indicators.quote[0].close.filter(Boolean).pop());
+    const expect = Number(jp.shares) * (jp.value / Number(jp.shares));  // reported per-share in DKK
+    const perShareDkk = jp.value / Number(jp.shares);
+    const impliedJpy = perShareDkk * (px(jpy) / px(fxr));
+    check('Toyota converts back to a plausible JPY price', impliedJpy > 1000 && impliedJpy < 8000,
+      `${perShareDkk.toFixed(2)} DKK/share implies ${impliedJpy.toFixed(0)} JPY`);
+  } else {
+    check('Toyota converts back to a plausible JPY price', false, 'could not fetch cross-check rates');
+  }
+}
 check('ETF look-through populated sectors', r.exposures.sector.length > 3, `${r.exposures.sector.length} sectors`);
 check('multi-currency exposure', r.exposures.currency.length >= 4, r.exposures.currency.map((c) => c.k).join(','));
+
+// --- security-level look-through -------------------------------------------
+const lt = r.exposures.lookthrough;
+check('look-through built', lt.length > 5, `${lt.length} underlying names`);
+check('look-through weights are sane', lt.every((e) => e.total > 0 && e.total <= 1.0001));
+const ltSum = lt.reduce((s, e) => s + e.total, 0);
+check('look-through totals to ~100%', Math.abs(ltSum - 1) < 0.02, `${(ltSum * 100).toFixed(2)}%`);
+
+// AAPL is held directly AND sits inside IWDA — the netting case that motivates
+// the whole feature. If this stops firing, the look-through has silently broken.
+const apple = lt.find((e) => e.key === 'AAPL');
+check('overlap detected for a directly-held index constituent', !!apple && apple.direct > 0 && apple.indirect > 0,
+  apple ? `direct ${(apple.direct * 100).toFixed(2)}% + via fund ${(apple.indirect * 100).toFixed(2)}% = ${(apple.total * 100).toFixed(2)}%` : 'AAPL missing');
+check('overlaps list non-empty', r.exposures.overlaps.length > 0,
+  r.exposures.overlaps.map((e) => e.key).join(','));
+check('unitemised fund remainder tracked', r.exposures.unitemised > 0,
+  `${(r.exposures.unitemised * 100).toFixed(1)}% beyond published top holdings`);
+
+// --- fallback price source --------------------------------------------------
+check('fallback declines non-US symbols', !api.StockAnalysis.supports('7203.T') && !api.StockAnalysis.supports('USDDKK=X'));
+check('fallback accepts US symbols', api.StockAnalysis.supports('AAPL'));
+try {
+  const fb = await api.StockAnalysis.bars('AAPL');
+  check('fallback source returns usable history', fb.rows.length > 500,
+    `${fb.rows.length} bars from ${fb.rows[0][0]}`);
+} catch (e) {
+  check('fallback source returns usable history', false, e.message);
+}
 
 // ---- render every tab -----------------------------------------------------
 const tabs = {};
@@ -118,6 +179,10 @@ check('no undefined leaked into markup', !/>\s*undefined|undefined%/.test(all));
 check('no NaN leaked into markup', !/NaN/.test(all));
 check('heatmap emitted cells', (tabs.risk.match(/<rect/g) || []).length > 25,
   `${(tabs.risk.match(/<rect/g) || []).length} rects`);
+check('look-through card rendered', /Look-through exposure/.test(tabs.risk));
+check('overlap called out in prose', /true exposure of/i.test(tabs.risk));
+check('CSV import UI present', /prl-csvtext/.test(tabs.positions));
+check('settings panel present', /prl-setsave/.test(tabs.data));
 check('stress windows reachable at default lookback', /COVID crash/.test(tabs.scenarios) && !/No stress window/.test(tabs.scenarios));
 check('no silent profile failure', !r.warnings.some((w) => /profiles unavailable/.test(w)) || /profiles unavailable/.test(tabs.positions),
   r.warnings.find((w) => /profiles/.test(w)) ? 'surfaced as a warning' : 'profiles loaded');

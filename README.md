@@ -12,7 +12,7 @@ you're already reading.
 It is a **userscript**: one file, no server, no account, no build step, no telemetry.
 Your holdings and all cached prices stay in your browser.
 
-![status](https://img.shields.io/badge/status-v0.1.0%20alpha-orange) ![license](https://img.shields.io/badge/license-MIT-blue)
+![status](https://img.shields.io/badge/version-1.0.0-blue) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 ---
 
@@ -34,17 +34,24 @@ Updates are automatic — Tampermonkey checks the `@updateURL` and pulls new ver
 ## What it does
 
 **Positions** — holdings with shares, cost basis, target weight and a one-line thesis.
-Everything converted to your reporting currency at daily FX.
+Everything converted to your reporting currency at daily FX. **CSV import** handles comma,
+semicolon and tab files, including the European convention of semicolons with comma decimal
+separators, and matches column names in English, Danish, Norwegian, Swedish and German — so a
+Nordic broker export imports without editing.
 
 **Risk**
 - **Risk contribution per position** — the share of portfolio volatility each name is
   responsible for. This is rarely its weight, and the gap is the whole point. In the test
   portfolio a 20% position in Novo Nordisk causes 33% of the risk while a 20% position in a
   world tracker causes 9%.
+- **Look-through exposure** — funds decomposed to the company, not just the sector. In the
+  test portfolio you hold Apple at 20.3% directly *plus* 1.7% inside the world tracker, for a
+  true exposure of 22.1%. No holdings list shows you that, and it is exactly the
+  concentration people get wrong.
 - **Clustered correlation heatmap** — co-moving names sorted together, so blocks of red
   reveal positions that are one bet wearing several tickers.
-- **Sector / country / currency exposure** with **ETF look-through**, so a world tracker is
-  decomposed into its underlying sector mix rather than scored as a single position.
+- **Sector / country / currency exposure**, with funds decomposed rather than counted as one
+  position.
 - **FX share of volatility** — how much of your risk is currency rather than companies.
 - Portfolio drawdown, volatility and benchmark beta.
 
@@ -113,18 +120,20 @@ still runs on everything you've loaded.
 
 | Layer | Source | Auth | If it breaks |
 |---|---|---|---|
-| Daily prices, all markets | Yahoo `chart` | none | falls back to cache |
-| FX (`USD{CUR}=X`) | Yahoo `chart` | none | falls back to cache |
-| Sector, country, ETF holdings | Yahoo `quoteSummary` | cookie + crumb | lose labels, keep all risk math |
+| Daily prices, all markets | Yahoo `chart` | none | falls back to stockanalysis (US), then cache |
+| Daily prices, US only | stockanalysis `history` | none | history back to 1982 |
+| FX (`USD{CUR}=X`) | Yahoo `chart` | none | position excluded with a visible warning |
+| Sector, country, fund holdings | Yahoo `quoteSummary` | cookie + crumb | lose labels, keep all risk math |
 
-One upstream dependency, split so the fragile half is non-essential. Verified working across
-US, Tokyo, Seoul, Xetra, Copenhagen, Amsterdam and UCITS ETFs. See
-[docs/DATA-SOURCES.md](docs/DATA-SOURCES.md) for what else was tested and rejected, and the
-fallback adapters designed but not yet needed.
+Layered so no single failure is fatal, and split so the fragile half is non-essential.
+Requests are paced — one in flight at a time with exponential backoff on 429 — because Yahoo
+rate-limits on burst, and a portfolio refresh is a burst. Verified across US, Tokyo, Seoul,
+Xetra, Copenhagen, Amsterdam and UCITS ETFs. See
+[docs/DATA-SOURCES.md](docs/DATA-SOURCES.md) for what else was tested and rejected.
 
 ---
 
-## Three things this gets right that most retail tools don't
+## Four things this gets right that most retail tools don't
 
 **Trading calendars don't align.** Tokyo closes about fourteen hours before New York on the
 same date stamp. Naively correlating daily closes across regions biases correlations toward
@@ -146,6 +155,16 @@ and will hand you confidently insane optimal weights. Risk Lens applies Ledoit-W
 toward a constant-correlation target (Ledoit & Wolf, 2003). On the test portfolio this pulls
 the correlation spread from 0.54 to 0.33 at δ = 0.38.
 
+**Currency conversion is as-of, not exact-match.** Equity and FX series do not share a
+calendar — Seoul trades on days the FX series skips. An exact-date lookup misses, and the
+tempting fallback is to use the local price unconverted. That is how a KRW price ends up
+treated as DKK, and it does not look wrong on screen: the weights still sum to 100%, they are
+just all wrong. (This project shipped that bug in v0.1.0 and it made Apple read 0.05% against
+a true 20.3%. Every test passed while it was live, because normalised weights always sum to
+one. The fix is a binary search for the nearest rate at or before the date; a position that
+genuinely cannot be converted is excluded with a visible warning rather than counted in the
+wrong unit.)
+
 **Numbers are never faked.** Every statistic declares its data requirement. A position with
 six months of history shows its weight and sector, and shows *"insufficient history"* where
 its beta would be. Failed fetches are reported explicitly and the affected name is excluded
@@ -162,35 +181,44 @@ non-overlapping trading sessions.
 
 ```bash
 node test/engine.test.mjs        # 20 checks on the maths
+node test/csv.test.mjs           # 21 checks on import parsing
+node test/ui.render.mjs out.html # 33 checks end to end, writes a preview
 ```
 
 Euler's theorem (risk contributions sum to 1.000000000000), positive semi-definiteness via
 Cholesky, shrinkage bounds, weekly-resample integrity, and that diversification actually
 reduces volatility below the weighted average of its parts.
 
-```bash
-node test/ui.render.mjs preview.html    # 18 checks on the full pipeline
-```
+The render harness shims `GM_*` and a minimal DOM — including a cookie jar, since Node's
+`fetch` has none and the crumb handshake would otherwise be untestable — then runs the real
+`analyse()` and renders every tab to a standalone HTML preview.
 
-Shims `GM_*` and a minimal DOM — including a cookie jar, since Node's `fetch` has none and the
-crumb handshake would otherwise be untestable — then runs the real `analyse()` and renders
-every tab. Checks balanced SVG and table markup, that no `undefined` or `NaN` leaks into the
-output, that stress windows are reachable at the default lookback, and that a failed profile
-fetch surfaces as a visible warning rather than silent "Unknown" labels. Writes a standalone
-HTML preview you can open in any browser.
+One test deserves explanation. It converts Toyota's reported per-share value back through an
+independently fetched spot rate and asserts the result is a plausible JPY price. That exists
+because the v0.1.0 currency bug passed every other check: weights are normalised, so they sum
+to 1 whether or not conversion happened. A test that cannot fail is not a test, and the
+cheapest way to catch a unit error is to convert back and see if you land where you started.
 
 ---
 
-## Status and limits
+## Status and known limits
 
-**v0.1.0, alpha.** The engine is tested; the UI has had far less mileage.
+**v1.0.0.** Engine, data layer and rendering are tested against live data. Be aware of these:
 
-- Yahoo's endpoints are internal, not a contracted API. They have been stable for years but
-  carry no guarantee. The cache and the adapter boundary are the mitigation.
+- **Interaction is untested in a real browser.** Every tab renders correctly and the numbers
+  are verified, but clicking, weight editing, the scenario recompute, CSV file drop, the SPA
+  re-mount and dark mode against stockanalysis's own theme have not been exercised by a human
+  or a driver. Expect rough edges and please open issues.
+- Look-through covers each fund's **published top holdings** — typically the top ten. The
+  remainder is reported as unitemised rather than silently dropped, but a name sitting at
+  position 40 of an index fund will not appear by name.
+- Yahoo's endpoints are internal, not a contracted API. Stable for years, but no guarantee.
+  The cache, the stockanalysis fallback and the adapter boundary are the mitigation.
 - Non-listed mutual fund share classes are hit-and-miss on Yahoo. Listed ETFs are reliable.
-- ETF look-through uses sector weights, not full holdings, so overlap between a tracker and a
-  single name you also hold directly is not yet netted out.
-- Stress windows are historical replays at fixed weights. They are not factor shocks.
+- Stress windows are historical replays at fixed weights. They are not factor shocks, and
+  they assume your current book existed then — which it did not.
+- Correlations and volatilities are backward-looking. They describe how these holdings *have*
+  moved together, which is not a promise about the next crisis.
 - Not investment advice. It is a calculator; the judgement stays yours.
 
 ---
