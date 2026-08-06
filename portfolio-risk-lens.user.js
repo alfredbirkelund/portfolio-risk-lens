@@ -34,7 +34,7 @@
   const DEFAULTS = {
     base: 'USD',              // reporting currency
     benchmark: 'URTH',        // iShares MSCI World; '^GSPC' for S&P 500
-    years: 5,                 // history window to request
+    years: 10,                // history window; must reach the oldest stress window
     freq: 'auto',             // 'auto' | 'weekly' | 'daily'
     volTargetPct: 2.0,        // per-position risk budget, % of portfolio vol
     barsTtlHours: 12,         // refetch bars older than this
@@ -512,10 +512,15 @@
     };
 
     // --- meta (optional) ---------------------------------------------------
+    // Enrichment only, but its failure must still be visible: silently showing
+    // every holding as sector "Unknown" would look like real data.
     const metaBySym = {};
+    let metaFailed = 0;
     for (let i = 0; i < live.length; i++) {
       onProgress(`profile ${i + 1}/${live.length}`);
-      metaBySym[live[i].sym] = await Cache.meta(live[i].sym);
+      const m = await Cache.meta(live[i].sym);
+      if (m.error) metaFailed++;
+      metaBySym[live[i].sym] = m;
     }
 
     // --- weights -----------------------------------------------------------
@@ -609,7 +614,7 @@
         meta: metaBySym[p.sym] || {}
       })),
       total, risk, exposures, failures,
-      warnings: buildWarnings(live, barsBySym)
+      warnings: buildWarnings(live, barsBySym, metaFailed)
     };
   }
 
@@ -652,8 +657,13 @@
     return { sector: srt(sector), country: srt(country), currency: srt(currency) };
   }
 
-  function buildWarnings(live, barsBySym) {
+  function buildWarnings(live, barsBySym, metaFailed) {
     const out = [];
+    if (metaFailed) {
+      out.push(metaFailed === live.length
+        ? 'Company profiles unavailable (the Yahoo crumb handshake failed) — sector and country show as Unknown and ETF look-through is off. Prices, correlation and every risk figure are unaffected.'
+        : `${metaFailed} of ${live.length} company profiles unavailable — those positions show sector Unknown.`);
+    }
     for (const p of live) {
       const rec = barsBySym[p.sym];
       if (rec.stale) out.push(`${p.sym}: using cached prices (refresh failed)`);

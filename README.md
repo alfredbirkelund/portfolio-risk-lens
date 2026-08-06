@@ -155,16 +155,29 @@ from every figure rather than silently zero-filled.
 
 ## Testing
 
+Both harnesses slice code out of the shipped userscript rather than duplicating it, so they
+test what actually ships. Both run against live Yahoo data for a deliberately awkward
+portfolio — US + Japan + Korea + Denmark + a UCITS ETF; five currencies, three regions,
+non-overlapping trading sessions.
+
 ```bash
-node test/engine.test.mjs
+node test/engine.test.mjs        # 20 checks on the maths
 ```
 
-Slices the maths and engine sections out of the shipped userscript — so it tests the real
-code, not a copy — and runs them against live Yahoo data for a deliberately awkward portfolio
-(US + Japan + Korea + Denmark + a UCITS ETF; five currencies, three regions, non-overlapping
-sessions). Twenty checks including Euler's theorem on risk contributions summing to one,
-positive semi-definiteness via Cholesky, shrinkage bounds, and that diversification actually
-reduces volatility below the weighted average.
+Euler's theorem (risk contributions sum to 1.000000000000), positive semi-definiteness via
+Cholesky, shrinkage bounds, weekly-resample integrity, and that diversification actually
+reduces volatility below the weighted average of its parts.
+
+```bash
+node test/ui.render.mjs preview.html    # 18 checks on the full pipeline
+```
+
+Shims `GM_*` and a minimal DOM — including a cookie jar, since Node's `fetch` has none and the
+crumb handshake would otherwise be untestable — then runs the real `analyse()` and renders
+every tab. Checks balanced SVG and table markup, that no `undefined` or `NaN` leaks into the
+output, that stress windows are reachable at the default lookback, and that a failed profile
+fetch surfaces as a visible warning rather than silent "Unknown" labels. Writes a standalone
+HTML preview you can open in any browser.
 
 ---
 
